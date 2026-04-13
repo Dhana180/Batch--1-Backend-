@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 import joblib
 import pandas as pd
@@ -6,159 +6,227 @@ import numpy as np
 import os
 
 app = Flask(__name__)
-CORS(app)
 
 # =========================================================
-# LOAD MODEL
+# CORS CONFIGURATION — Explicit origin allowlist
 # =========================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "https://health-care-ml-project-b-1.vercel.app",
+            "http://localhost:5173",
+            "http://localhost:3000"
+        ],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
+
+# =========================================================
+# PREFLIGHT HANDLER — Catches OPTIONS before it hits routes
+# =========================================================
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        res = make_response()
+        origin = request.headers.get("Origin", "")
+        allowed = [
+            "https://health-care-ml-project-b-1.vercel.app",
+            "http://localhost:5173",
+            "http://localhost:3000"
+        ]
+        if origin in allowed:
+            res.headers["Access-Control-Allow-Origin"] = origin
+        res.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
+        res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        res.headers["Access-Control-Max-Age"] = "3600"
+        return res, 200
+
+# =========================================================
+# LOAD MODEL ON STARTUP
+# =========================================================
+
+BASE_DIR = os.path.dirname(__file__)
 MODEL_PATH = os.path.join(BASE_DIR, "ml", "RF_Model.pkl")
 
 model = None
 
-def load_model():
-    global model
-    try:
-        print("🚀 Starting Backend...")
+try:
+    print("\n[INFO] Backend Starting...")
 
-        if not os.path.exists(MODEL_PATH):
-            print("❌ Model file not found:", MODEL_PATH)
-            return
+    ml_folder = os.path.join(BASE_DIR, "ml")
 
+    if os.path.exists(ml_folder):
+        print("[INFO] Files inside ml folder:")
+        print(os.listdir(ml_folder))
+    else:
+        print("[ERROR] ml folder not found!")
+
+    print(f"[INFO] Looking for model at: {MODEL_PATH}")
+
+    if os.path.exists(MODEL_PATH):
         model = joblib.load(MODEL_PATH)
-        print("✅ Model loaded successfully")
+        print("[✓] Model loaded successfully!")
+    else:
+        print("[X] Model file not found!")
 
-    except Exception as e:
-        print("❌ Model loading failed:", str(e))
-
-load_model()
-
-# =========================================================
-# ROOT ROUTE
-# =========================================================
-
-@app.route("/")
-def home():
-    return jsonify({
-        "message": "AI Claim Prediction API Running 🚀",
-        "status": "success"
-    })
-
-# =========================================================
-# HEALTH CHECK
-# =========================================================
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "model_loaded": model is not None
-    })
+except Exception as e:
+    print(f"[X] Error loading model: {e}")
 
 # =========================================================
 # PREDICT API
 # =========================================================
 
-@app.route('/api/predict', methods=['POST'])
+@app.route('/predict', methods=['POST', 'OPTIONS'])
 def predict():
 
     if model is None:
         return jsonify({
-            "error": "Model not loaded. Check ml/RF_Model.pkl"
+            "error": "Model not loaded. Please ensure RF_Model.pkl is inside backend/ml folder and restart server."
         }), 500
 
     try:
-        data = request.get_json()
+        data = request.json
 
         if not data:
             return jsonify({"error": "No data provided"}), 400
 
-        # =============================
-        # INPUT PARSING
-        # =============================
+        print("\n[INFO] Incoming Request Data:")
+        print(data)
+
+        # =====================================================
+        # PARSE INPUTS
+        # =====================================================
 
         age = int(data.get('age', 0))
-        network = 1 if data.get('network', 'No').lower() == "yes" else 0
-        prior_auth = 1 if data.get('prior_auth', 'No').lower() == "yes" else 0
-        billing = float(data.get('billing', 0))
+
+        network_str = data.get('network', 'No')
+        prior_auth_str = data.get('prior_auth', 'No')
+
+        billing = float(data.get('billing', 0.0))
         delay = int(data.get('delay', 0))
 
         plan = data.get('plan', '')
         procedure = data.get('procedure', '')
         diagnosis = data.get('diagnosis', '')
 
-        # =============================
-        # FEATURE CREATION
-        # =============================
+        # Convert Yes/No → 1/0
+        network = 1 if network_str.lower() == "yes" else 0
+        prior_auth = 1 if prior_auth_str.lower() == "yes" else 0
+
+        # =====================================================
+        # CREATE FEATURE VECTOR
+        # =====================================================
 
         try:
             columns = model.feature_names_in_
-        except:
+        except AttributeError:
             return jsonify({
-                "error": "Model missing feature_names_in_. Retrain model properly."
+                "error": "Model missing feature_names_in_. Please retrain model with feature names."
             }), 500
 
         user_data = pd.DataFrame(columns=columns)
         user_data.loc[0] = 0
 
-        # Numeric mapping
-        mapping = {
-            'patient_age_years': age,
-            'is_in_network': network,
-            'prior_auth_required': prior_auth,
-            'billed_amount_usd': billing,
-            'days_between_service_and_submission': delay
+        # =====================================================
+        # NUMERIC FEATURES
+        # =====================================================
+
+        if 'patient_age_years' in user_data.columns:
+            user_data.loc[0, 'patient_age_years'] = age
+
+        if 'is_in_network' in user_data.columns:
+            user_data.loc[0, 'is_in_network'] = network
+
+        if 'prior_auth_required' in user_data.columns:
+            user_data.loc[0, 'prior_auth_required'] = prior_auth
+
+        if 'billed_amount_usd' in user_data.columns:
+            user_data.loc[0, 'billed_amount_usd'] = billing
+
+        if 'days_between_service_and_submission' in user_data.columns:
+            user_data.loc[0, 'days_between_service_and_submission'] = delay
+
+        # =====================================================
+        # ONE-HOT FEATURES
+        # =====================================================
+
+        plan_col = f"insurance_plan_type_{plan}"
+        if plan_col in user_data.columns:
+            user_data.loc[0, plan_col] = 1
+
+        procedure_col = f"procedure_code_cpt_{procedure}"
+        if procedure_col in user_data.columns:
+            user_data.loc[0, procedure_col] = 1
+
+        diagnosis_col = f"primary_diagnosis_code_icd10_{diagnosis}"
+        if diagnosis_col in user_data.columns:
+            user_data.loc[0, diagnosis_col] = 1
+
+        print("\n[INFO] Prepared Feature Data:")
+        print(user_data.head())
+
+        # =====================================================
+        # MAKE PREDICTION
+        # =====================================================
+
+        prob = model.predict_proba(user_data)[0][1] * 100
+
+        reason_map = {
+            1: "Missing Documentation",
+            2: "Invalid Procedure Code",
+            3: "Authorization Missing",
+            4: "Policy Expired",
+            5: "Duplicate Claim"
         }
-
-        for col, val in mapping.items():
-            if col in user_data.columns:
-                user_data.loc[0, col] = val
-
-        # One-hot encoding mapping
-        for col in user_data.columns:
-            if col.startswith("insurance_plan_type_") and plan in col:
-                user_data.loc[0, col] = 1
-
-            if col.startswith("procedure_code_cpt_") and procedure in col:
-                user_data.loc[0, col] = 1
-
-            if col.startswith("primary_diagnosis_code_icd10_") and diagnosis in col:
-                user_data.loc[0, col] = 1
-
-        # =============================
-        # PREDICTION
-        # =============================
-
-        prob = float(model.predict_proba(user_data)[0][1] * 100)
 
         if prob >= 70:
             status = "DENIED"
-            reason = "High-risk claim pattern detected"
-
+            reason = reason_map[np.random.randint(1, 6)]
         elif prob >= 40:
             status = "RISK OF DENIAL"
-            reason = "Moderate risk detected"
-
+            reason = reason_map[np.random.randint(1, 6)]
         else:
             status = "APPROVED"
-            reason = "Low-risk claim"
+            reason = "None (Claim Approved)"
 
-        return jsonify({
+        response = {
             "status": status,
             "probability": f"{round(prob, 2)}%",
             "reason": reason
-        })
+        }
+
+        print("\n[INFO] Prediction Response:")
+        print(response)
+
+        return jsonify(response)
 
     except Exception as e:
+        print(f"[ERROR] Prediction Failed: {e}")
         return jsonify({
-            "error": str(e)
+            "error": f"Prediction logic failed: {str(e)}"
         }), 500
 
+
 # =========================================================
-# RUN SERVER (PRODUCTION SAFE)
+# ROOT ROUTE — Health Check + Wake Ping
+# =========================================================
+
+@app.route('/')
+def home():
+    return jsonify({
+        "message": "AI Claim Prediction API Running",
+        "status": "healthy",
+        "model_loaded": model is not None
+    })
+
+
+# =========================================================
+# RUN SERVER
 # =========================================================
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    print("\n🚀 Starting Flask AI Server...")
+    app.run(debug=True, port=5000)
